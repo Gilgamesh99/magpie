@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -325,6 +326,9 @@ type providerJSON struct {
 	// Claude's, the accounts are kept to Claude Code's own sign-in and
 	// serve no request through magpie (myduso on Discord)
 	SwitchOnly bool `json:"switchOnly,omitempty"`
+	// SignInMoves: how magpie moves Codex's or Claude Code's own sign-in
+	// between its accounts (provider.SignInMovesOf), said beside them
+	SignInMoves *provider.SignInMoves `json:"signInMoves,omitempty"`
 	// RestartApp: magpie restarts the Codex app's app-server for an
 	// account change it makes by itself (provider.Provider.RestartApp)
 	RestartApp bool `json:"restartApp,omitempty"`
@@ -336,6 +340,11 @@ type providerJSON struct {
 	// LibraryMCP: a Remote magpie whose router is a Library server, or
 	// is to be one (library.RemoteMCPOn)
 	LibraryMCP bool `json:"libraryMCP,omitempty"`
+	// LibraryShared: a Remote magpie whose Library's skills and prompts
+	// are used here (library.BorrowedOn), and LibraryNote what its last
+	// read said went wrong or was left as the user's (KoiLx0 on X)
+	LibraryShared bool   `json:"libraryShared,omitempty"`
+	LibraryNote   string `json:"libraryNote,omitempty"`
 	// RemoteUpdate: a Remote magpie's word on its last ask to follow
 	// this magpie's version (remoteUpdateNote)
 	RemoteUpdate *remoteUpdateJSON `json:"remoteUpdate,omitempty"`
@@ -425,6 +434,10 @@ type providerJSON struct {
 	// Move is where a built-in subscription stands with the community
 	// plugin that can run it (provider.Move): set for those that have one
 	Move *moveJSON `json:"move,omitempty"`
+	// ProxyGone names a saved proxy this provider (or one of its accounts)
+	// chooses that isn't on this computer: its requests fail until another
+	// is picked, as a missing proxy never means a direct connection.
+	ProxyGone string `json:"proxyGone,omitempty"`
 	// a subscription account's rests in force, by its user in lower case:
 	// its own and each of its models' (maxleebeta on Discord: WorkBuddy's
 	// 429 "将在 … 重置" rested a model, credits left, and nothing here said so)
@@ -695,6 +708,9 @@ type providersJSON struct {
 	// after Codex was switched to another, until it is quit and opened
 	// again (provider.CodexAppStale)
 	CodexApp string `json:"codexApp,omitempty"`
+	// CodexProjects says the open Codex app shows fewer projects than
+	// Codex's accounts have, after a switch (provider.CodexAppProjectsShort)
+	CodexProjects bool `json:"codexProjects,omitempty"`
 	// Plugins are the providers the plugins sign in to, for the add sheet
 	Plugins []pluginSubJSON `json:"plugins"`
 	// OnPlugins are the built-in subscriptions moved onto their plugins,
@@ -842,6 +858,9 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		AccountConcurrency: p.AccountConcurrency, AccountWeights: p.AccountWeights, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM,
 		Outputs: provider.OutputsOf(p.ID), Compacts: provider.CompactsOf(p.ID),
 	}
+	if p.Account != nil && p.Account.Agent == p.ID {
+		out.SignInMoves = provider.SignInMovesOf(p.ID)
+	}
 	if p.Account != nil {
 		for _, r := range p.AccountRefs() {
 			if s := provider.SeatNameOf(p.ID, r); s != "" {
@@ -904,6 +923,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 	}
 	out.Key.Set = p.Key != ""
 	out.Key.Masked = provider.Mask(p.Key)
+	out.ProxyGone = provider.ProxyGone(p)
 	if provider.BuiltinRetired(p.ID) {
 		// only its plugin's row is listed now: built-in accounts not moved
 		// yet are providersJSON.Unmoved's
@@ -947,6 +967,22 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 			ks.Reset = &reset
 		}
 		out.KeyList[i].Spend = ks
+	}
+	// a key whose windows magpie reads takes a usage cap as an account
+	// does, and says when the cap holds it (the gateway holds it by the
+	// same reading, gateway.keyCapHeld)
+	if p.TakesUsageCap() && p.Account == nil {
+		now := time.Now()
+		for i, k := range out.KeyList {
+			out.KeyList[i].UsageCap = true
+			ka, ok := p.KeyAccountOf(k.ID)
+			if !ok {
+				continue
+			}
+			if h := p.KeyCapHeld(ka, "", now, provider.KeyAllowance); h != nil {
+				out.KeyList[i].CapHeld = &provider.KeyCapState{Used: h.Used, Cap: h.Cap, Back: h.Back}
+			}
+		}
 	}
 	// and one with a balance typed, what is left of it (the card on the
 	// Usage page shows the same, provider.ownBalanceCard)
@@ -1037,7 +1073,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		if imageSet {
 			images = said
 		}
-		window := p.WindowOf(m)
+		window := p.WindowIn(m, set)
 		j := modelJSON{ID: m.ID, Name: m.Name, Efforts: provider.EffortsOf(m), On: on, Context: window, Output: provider.OutputWithin(window, p.ReplyLimitIn(m, set)), Listed: provider.ListedWindow(m), ListedOutput: provider.OutputWithin(provider.ListedWindow(m), p.ReplyLimitIn(m, settings.Settings{})), Max: m.MaxContext, Free: m.Free, Rate: m.Rate, RateWas: m.RateWas, Images: images, ImageSet: imageSet, Own: own, Best: newest[m.ID]}
 		list, listed, free := pricer.Prices(set, m.ID)
 		j.Zero = !m.Free && free
@@ -1323,6 +1359,8 @@ func providersState() providersJSON {
 				remoteMCP = library.RemoteMCPOn()
 			}
 			info.LibraryMCP = remoteMCP[p.ID]
+			info.LibraryShared = library.BorrowedOn()[p.ID]
+			info.LibraryNote = library.BorrowNote(p.ID)
 			info.RemoteUpdate = remoteUpdateNote(p.ID, time.Now())
 		}
 		s.Providers = append(s.Providers, info)
@@ -1395,6 +1433,7 @@ func providersState() providersJSON {
 	s.Gateway.Archive = archiveState()
 	s.CodexDaemon = provider.CodexDaemonStale()
 	s.CodexApp = provider.CodexAppStale()
+	s.CodexProjects = provider.CodexAppProjectsShort()
 	s.Plugins = pluginSubs()
 	s.Fetching = provider.FetchingNew()
 	return s
@@ -1438,6 +1477,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 	tuneRoutes(mux)
 	groupRoutes(mux)
 	localHostsRoutes(mux)
+	catalogModelsRoutes(mux)
 	// how each key's or account's requests stand under its limit on
 	// requests at once (#892), read every two seconds while a provider's
 	// rows are shown; empty when the gateway runs elsewhere
@@ -1692,6 +1732,9 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			// router a Library server (library.SetRemoteMCP); left out,
 			// it stays as it is
 			LibraryMCP *bool `json:"libraryMCP"`
+			// LibraryShared, on a Remote magpie, is the switch for its
+			// Library's skills and prompts (library.SetBorrow)
+			LibraryShared *bool `json:"libraryShared"`
 			// CopyOf, with New, is the provider the new one is a copy of
 			// (#268): its key and what else the form doesn't carry are
 			// taken from it when left out
@@ -2396,6 +2439,24 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					askHub = *req.LibraryMCP
 				}
 			}
+			if req.LibraryShared != nil {
+				if p, err := provider.Find(in.ID); err == nil && p.IsRemoteMagpie() && library.BorrowedOn()[in.ID] != *req.LibraryShared {
+					if _, err := library.SetBorrow(in.ID, *req.LibraryShared); err != nil {
+						fail(rw, err)
+						return
+					}
+					if *req.LibraryShared {
+						id := in.ID
+						go func() {
+							ctx, cancel := context.WithTimeout(context.Background(), 2*provider.RemoteLibraryWait)
+							defer cancel()
+							if _, err := library.UseRemoteLibrary(ctx, id); err != nil {
+								log.Printf("library: the Library of %s: %v", id, err)
+							}
+						}()
+					}
+				}
+			}
 			provider.ForgetBalances()
 			if old == nil || old.AccessKeyID != in.AccessKeyID || old.SecretAccessKey != in.SecretAccessKey {
 				// the plan's windows are read afresh with the new access key
@@ -2961,6 +3022,8 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 			provider.DismissCodexDaemon()
 		case "dismiss-app":
 			provider.DismissCodexApp()
+		case "dismiss-projects":
+			provider.DismissCodexAppProjects()
 		case "restart-app":
 			// the Codex app left on the account before: its app-server
 			// restarted now, after the user said yes (nb5p_hQ on X)

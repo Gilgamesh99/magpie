@@ -234,7 +234,7 @@ function renderGatewayKeys() {
     tick.onclick = () => gatewayKeyAction(k.off ? "on-key" : "off-key", { key: k.id });
     // the copy sits by the key it copies (the owner: stranded among the
     // badges it read as nobody's); Rotate and Remove wait in the row's menu
-    row.append(tick, gatewayRename(k), el("span", "plan mono", k.masked), copyCallerKeyBtn(k), el("span", "grow"), ...(k.browser ? [gatewayBrowserTag()] : k.readOnly ? [gatewayReadOnlyTag()] : []), gatewayModelsBadge(k), ...gatewayKeptOutBadge(k), ...gatewayMCPBadge(k), gatewayQuotasBadge(k), ...(k.browser || k.readOnly ? [] : [gatewayConcurrencyBadge(k)]), gatewayLimitBadge(k), gatewayKeyMore(k));
+    row.append(tick, gatewayRename(k), el("span", "plan mono", k.masked), copyCallerKeyBtn(k), el("span", "grow"), ...(k.browser ? [gatewayBrowserTag()] : k.readOnly ? [gatewayReadOnlyTag()] : []), gatewayModelsBadge(k), ...gatewayKeptOutBadge(k), ...gatewayMCPBadge(k), gatewayQuotasBadge(k), ...(k.browser || k.readOnly ? [] : [gatewayConcurrencyBadge(k), gatewayTierBadge(k)]), gatewayLimitBadge(k), gatewayKeyMore(k));
     const under = gatewayLimit?.id === k.id ? [gatewayLimitEditor(k)] : keyUsed(k).map((u) => gatewayLimitLine(k, u));
     if (under.length) row.classList.add("with-limit"), row.append(...under);
     list.append(row);
@@ -650,7 +650,7 @@ function gatewayModelsBadge(k) {
   b.setAttribute("aria-label", t("Models this key may use"));
   b.setAttribute("aria-haspopup", "menu");
   b.setAttribute("aria-expanded", "false");
-  const open = (models, accounts, groups) => {
+  const open = (models, accounts, groups, bare) => {
     if (!b.isConnected) return;
     const opts = [{ v: "", name: "All models", note: "Any model and any account, now and later" }];
     const seen = new Set();
@@ -715,6 +715,15 @@ function gatewayModelsBadge(k) {
       opts.push({ v: m.id, find: m.id, name: m.name, note: m.decides ? m.id + " · " + t("Decision model: a routing group asks it whatever this key may use; pick it so the key may ask it itself") : m.id, literalName: true });
     }
     endBlock();
+    // a provider serving no model now can still be allowed whole, for the
+    // models it serves later, its accounts after it
+    for (const m of bare || []) {
+      if (seen.has(m.provider)) continue;
+      seen.add(m.provider);
+      opts.push({ v: m.provider + "/*", name: t("Every {provider} model", { provider: m.providerName }), note: m.provider + "/*", literalName: true });
+      for (const o of ofProvider.get(m.provider) || []) opts.push(o);
+      ofProvider.delete(m.provider);
+    }
     // a provider with accounts and no model in the list (one kept
     // unlisted, or serving none now) keeps its accounts after the models
     for (const os of ofProvider.values()) opts.push(...os);
@@ -761,15 +770,15 @@ function gatewayModelsBadge(k) {
     e.stopPropagation();
     if (b.classList.contains("open")) return closeProtoMenu();
     const loading = keyModelsLoading = { id: k.id, open };
-    let models = [], accounts = [], groups = [];
-    try { ({ models, accounts, groups } = await api("caller-keys/models")); } catch (err) {
+    let models = [], accounts = [], groups = [], bare = [];
+    try { ({ models, accounts, groups, providers: bare } = await api("caller-keys/models")); } catch (err) {
       if (keyModelsLoading === loading) keyModelsLoading = null;
       status(t(err.message), "err");
       return;
     }
     if (keyModelsLoading !== loading) return;
     keyModelsLoading = null;
-    loading.open(models, accounts, groups);
+    loading.open(models, accounts, groups, bare);
   };
   if (keyModelsLoading?.id === k.id) keyModelsLoading.open = open;
   return b;
@@ -955,6 +964,37 @@ function gatewayConcurrencyBadge(k) {
       if (v === -1) return other();
       if (v !== own) set(v);
     }, "Requests at once", "sess-menu");
+  };
+  return b;
+}
+
+// the service tier a key's requests go at (JackyFill on X): as they ask, or
+// standard, Fast or Ultrafast whatever they ask; a provider with no service
+// tiers is sent none
+const KEY_TIERS = [
+  { v: "", name: "As the request asks", note: "" },
+  { v: "default", name: "Standard", note: "" },
+  { v: "priority", name: "Fast", note: "priority" },
+  { v: "ultrafast", name: "Ultrafast", note: "ultrafast" },
+];
+function gatewayTierBadge(k) {
+  const own = k.serviceTier || "";
+  const cur = KEY_TIERS.find((o) => o.v === own) || KEY_TIERS[0];
+  const b = el("button", "amodels key-tier" + (own ? " set" : ""));
+  b.type = "button";
+  b.textContent = t(own ? cur.name : "Service tier");
+  b.title = t(own ? "This key's requests go at this service tier, whatever they ask" : "This key's requests keep the service tier they ask for");
+  b.setAttribute("aria-label", t("Service tier"));
+  b.setAttribute("aria-haspopup", "menu");
+  b.setAttribute("aria-expanded", "false");
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (b.classList.contains("open")) return closeProtoMenu();
+    openProtoMenu(b, KEY_TIERS, cur.v, async (v) => {
+      if (v === cur.v) return;
+      const out = await gatewayKeyAction("tier-key", { key: k.id, serviceTier: v });
+      if (out) status(t("{who}: service tier {tier}", { who: k.name, tier: t(KEY_TIERS.find((o) => o.v === v).name) }), "ok");
+    }, "Service tier", "sess-menu");
   };
   return b;
 }

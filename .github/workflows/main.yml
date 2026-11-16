@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  UPSTREAM_REPOSITORY:  yetone/magpie
+  UPSTREAM_REPOSITORY: yetone/magpie
   UPSTREAM_BRANCH: main
   TARGET_BRANCH: main
 

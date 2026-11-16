@@ -24,6 +24,10 @@ const (
 type newAPI struct {
 	mu    sync.Mutex
 	calls map[string]int
+	// a fork's refusal of a GPT on Anthropic, where it differs from New
+	// API's 503 (WandAPI answers 404)
+	status int
+	body   string
 }
 
 func (f *newAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -42,6 +46,12 @@ func (f *newAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/v1/messages" && gpt:
+		if f.status != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(f.status)
+			io.WriteString(w, f.body)
+			return
+		}
 		refuse(newAPINoChannelClaude)
 	case r.URL.Path != "/v1/messages" && !gpt:
 		refuse(newAPINoChannelOpenAI)
@@ -136,5 +146,56 @@ func TestNoChannelWithNothingElseIsTheError(t *testing.T) {
 	}
 	if !srv.fits("relay", "gpt-6.1-sol", provider.Anthropic) {
 		t.Error("the only API was marked unfit")
+	}
+}
+
+// wandAPINoSource is WandAPI's 404 to Claude Code's /v1/messages for
+// gpt-6.1-terra, byte for byte as its 181 bytes were (equinox0253 on X,
+// 11-13): no channel, no model named, the entry protocol in other words
+// than gpt-6.1-sol's "不支持当前入口协议".
+const wandAPINoSource = `{"type":"error","error":{"type":"not_found_error","message":"当前没有能承接该入口协议的货源，请联系管理员为端点补充入口格式或配置协议适配。"}}`
+
+// WandAPI answers 404 where New API answers 503 (equinox0253 on X). The
+// fallback follows the body's shape (New API's model_not_found code, its
+// message naming the group), not the status alone: a 404 of any other kind
+// is the relay's word, and nothing is remembered.
+func TestNoChannelAs404FromAFork(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		falls      bool
+	}{
+		{"fork no channel", `{"error":{"message":"分组 default 下模型 gpt-6.1-sol 暂无渠道","type":"new_api_error","code":"model_not_found"}}`, true},
+		// WandAPI's own words (equinox0253 on X, 11-13): the protocol
+		// named, no channel; a wrong endpoint (wrongEndpoint) as the
+		// tweet's screenshot reads it
+		{"entry protocol", `{"error":{"message":"模型 gpt-6.1-sol 不支持当前入口协议","type":"new_api_error","code":"model_not_found"}}`, true},
+		{"entry protocol, Anthropic's shape", `{"type":"error","error":{"type":"invalid_request_error","message":"模型 gpt-6.1-sol 不支持当前入口协议"}}`, true},
+		{"entry protocol, no source (gpt-6.1-terra)", wandAPINoSource, true},
+		{"missing model", `{"error":{"message":"The model gpt-6.1-sol does not exist or you do not have access to it.","type":"invalid_request_error","code":"model_not_found"}}`, false},
+		{"wrong base URL", `404 page not found`, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("XDG_CACHE_HOME", t.TempDir())
+			f := &newAPI{status: 404, body: c.body}
+			up := httptest.NewServer(f)
+			t.Cleanup(up.Close)
+			if err := provider.Save(provider.Provider{ID: "relay", Name: "Relay", Key: "k", Models: []string{"gpt-6.1-sol"},
+				Chat: up.URL + "/v1", Anthropic: up.URL}); err != nil {
+				t.Fatal(err)
+			}
+			srv := New()
+			rec := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"relay/gpt-6.1-sol","max_tokens":100,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+			if c.falls {
+				if rec.Code != 200 || !strings.Contains(rec.Body.String(), "gpt ok") || srv.fits("relay", "gpt-6.1-sol", provider.Anthropic) {
+					t.Fatalf("no fallback: %d %s", rec.Code, rec.Body.String())
+				}
+				return
+			}
+			if rec.Code != 404 || !srv.fits("relay", "gpt-6.1-sol", provider.Anthropic) || f.count("/v1/chat/completions gpt") != 0 {
+				t.Fatalf("a real 404 was turned into a protocol switch: %d %s %v", rec.Code, rec.Body.String(), f.calls)
+			}
+		})
 	}
 }

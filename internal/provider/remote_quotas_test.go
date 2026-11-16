@@ -67,6 +67,10 @@ func (f *fakePeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if f.status != 0 {
 		w.WriteHeader(f.status)
+		if f.status == http.StatusForbidden {
+			// the gateway's own word for a magpie that isn't shared
+			w.Write([]byte(`{"error":{"message":"magpie's quotas are told to another machine only when magpie is shared on the local network (Settings → Network and sharing → Share on local network) and the request carries its API key"}}`))
+		}
 		return
 	}
 	if f.held {
@@ -288,7 +292,9 @@ func TestKeptQuotaReportAsksNobody(t *testing.T) {
 		c.Unlock()
 	})
 	qs := KeptQuotaReport(time.Now())
-	if len(qs) != 1 || qs[0].Provider != "codex" || qs[0].Kind != "subscription" || len(qs[0].Windows) != 1 || qs[0].Windows[0].Used != 62 || qs[0].Windows[0].ResetsAt == nil {
+	// a ChatGPT card's image row (#6160, WithImageLane) is made from what
+	// the gateway remembers, not read
+	if len(qs) != 1 || qs[0].Provider != "codex" || qs[0].Kind != "subscription" || len(qs[0].Windows) != 2 || qs[0].Windows[0].Used != 62 || qs[0].Windows[0].ResetsAt == nil || qs[0].Windows[1].Lane != "images" {
 		t.Fatalf("report: %+v", qs)
 	}
 	if SubscriptionUsageReading() {
@@ -666,5 +672,111 @@ func TestRemoteCardsFollowEnabledModelsAndDedupe(t *testing.T) {
 		if strings.Contains(q.Provider, "kiro") {
 			t.Errorf("a card of a provider the Remote isn't enabled for is passed on: %+v", q)
 		}
+	}
+}
+
+// @748975219 on X (0.1.3771): with only relay/strata/model enabled, the
+// cards of relay/kiro and relay/codex still passed, as only the first part
+// of the card's id was compared.
+func TestRemoteCardWantedByWholePath(t *testing.T) {
+	cases := []struct {
+		name string
+		ids  []string
+		yes  []string
+		no   []string
+	}{
+		{"two levels", []string{"relay/strata/m"}, []string{"relay/strata", "relay"}, []string{"relay/kiro", "relay/codex", "kiro", "relay/strata/x"}},
+		{"three levels", []string{"a/b/c/m"}, []string{"a/b/c", "a/b", "a"}, []string{"a/b/d", "a/x", "a/b/c/d", "b"}},
+		{"not at a boundary", []string{"relay/kiro/m"}, []string{"relay/kiro"}, []string{"relay/kir", "relay/kiro2", "relay/kiroo", "rel"}},
+		{"prefix of the other way", []string{"relay/kir/m"}, []string{"relay/kir"}, []string{"relay/kiro"}},
+		{"several", []string{"relay/strata/m", "relay/kiro/n"}, []string{"relay/strata", "relay/kiro"}, []string{"relay/codex"}},
+		{"one level", []string{"kiro/m"}, []string{"kiro"}, []string{"codex", "kiro/x"}},
+		{"unknown provider", []string{"m"}, []string{"anything", "a/b"}, nil},
+	}
+	for _, c := range cases {
+		w := cardWantedFor(c.ids)
+		for _, id := range c.yes {
+			if !w(id) {
+				t.Errorf("%s: %v should tell %q", c.name, c.ids, id)
+			}
+		}
+		for _, id := range c.no {
+			if w(id) {
+				t.Errorf("%s: %v should not tell %q", c.name, c.ids, id)
+			}
+		}
+	}
+}
+
+// A user on X (0.1.3929): a Remote magpie added for the Usage page's
+// quotas, with Select none (no model of it served), showed the remote's
+// cards before cfd49e36a and none after, as no card was wanted of a
+// provider with no enabled model. Select none still reads and shows usage.
+func TestRemoteSelectNoneStillShowsItsCards(t *testing.T) {
+	peer := &fakePeer{cards: []SubscriptionQuota{
+		{Provider: "kiro", Name: "Kiro", Kind: "subscription", User: "k@x.com", Windows: []QuotaWindow{{Name: "credits", Used: 10}}},
+		{Provider: "codex", Name: "Codex", Kind: "subscription", User: "a@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 40}}},
+	}}
+	remoteQuotaHome(t, peer)
+	p, err := Find("office")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.NoModels, p.Models = true, nil
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	ForgetRemoteCardsForTest()
+	got := map[string]bool{}
+	for _, q := range RemoteCards(context.Background()) {
+		if q.Kind == "subscription" && q.Error == "" {
+			got[q.Provider] = true
+		}
+	}
+	if !got["office/kiro"] || !got["office/codex"] {
+		t.Fatalf("a Remote set to serve no model still tells its cards: %v", got)
+	}
+}
+
+// fcooji on X (0.1.3959): Claude Code set to usage only on the remote lists
+// no Claude model there, so a Remote with nothing picked here (exposing
+// whatever the remote lists) dropped Claude's card. Only picks narrow cards.
+func TestRemoteUsageOnlyProviderStillShowsItsCard(t *testing.T) {
+	peer := &fakePeer{cards: []SubscriptionQuota{
+		{Provider: "claude", Name: "Claude", Kind: "subscription", User: "c@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 20}}},
+		{Provider: "codex", Name: "Codex", Kind: "subscription", User: "a@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 40}}},
+	}}
+	remoteQuotaHome(t, peer)
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"object":"list","data":[{"id":"codex/gpt-6","object":"model","owned_by":"codex"}]}`))
+	}))
+	defer list.Close()
+	ctx := context.Background()
+	p, err := Find("office")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerURL, anth := p.Chat, p.Anthropic
+	p.Chat, p.Anthropic = list.URL, list.URL
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = Find("office")
+	if _, err := p.Fetch(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.Chat, p.Anthropic = peerURL, anth
+	if err := Save(*p); err != nil {
+		t.Fatal(err)
+	}
+	ForgetRemoteCardsForTest()
+	got := map[string]bool{}
+	for _, q := range RemoteCards(ctx) {
+		if q.Kind == "subscription" && q.Error == "" {
+			got[q.Provider] = true
+		}
+	}
+	if !got["office/claude"] || !got["office/codex"] {
+		t.Fatalf("nothing picked: every card of the remote is told: %v", got)
 	}
 }
